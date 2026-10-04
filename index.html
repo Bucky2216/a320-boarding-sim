@@ -1,0 +1,1169 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>空客 A320 登机顺序模拟</title>
+<!--
+  ============================================================
+  空客 A320 登机顺序模拟（单文件、纯前端、无外部依赖）
+
+  目的：观察"登机顺序"如何影响登机总完成时间。
+  核心机制：单通道飞机里，任何人在过道里放行李都会把后面的乘客堵住，
+           后面的人无法超越，只能等；等的时间就是登机总时间的主要来源。
+
+  文件结构：
+    1) <style>            —— 页面样式（自适应浅色/深色）
+    2) <body>             —— 页面结构
+    3) <script id="sim-engine">  —— 纯逻辑仿真引擎（不依赖 DOM，可单独测试）
+    4) 最后一个 <script>   —— 界面：动画渲染、图表、蒙特卡洛对比
+  ============================================================
+-->
+<style>
+  /* ---------- 主题变量：支持系统浅色/深色 ---------- */
+  :root {
+    color-scheme: light dark;
+    --bg: #f5f6f8;
+    --panel: #ffffff;
+    --fg: #14181f;
+    --muted: #5b6673;
+    --line: #e3e7ed;
+    --seat: #e6eaef;
+    --seat-line: #ccd3dc;
+    --blue: #2a6df4;
+    --green: #1f9d55;
+    --orange: #db7c0b;
+    --red: #dd3b41;
+    --purple: #7b5cf0;
+    --shadow: 0 1px 2px rgba(16, 24, 40, .06), 0 8px 24px rgba(16, 24, 40, .05);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1015;
+      --panel: #151a21;
+      --fg: #e9edf3;
+      --muted: #98a2b3;
+      --line: #262d38;
+      --seat: #222932;
+      --seat-line: #333c49;
+      --blue: #4b86ff;
+      --green: #35c06f;
+      --orange: #f2994a;
+      --red: #ff5f66;
+      --purple: #9b7cff;
+      --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 8px 24px rgba(0, 0, 0, .3);
+    }
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font: 14px/1.6 -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB",
+          "Microsoft YaHei", "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1240px; margin: 0 auto; padding: 22px 18px 56px; }
+
+  header.top h1 { font-size: 21px; font-weight: 600; margin: 0 0 6px; letter-spacing: .2px; }
+  header.top p { margin: 0; color: var(--muted); font-size: 13px; }
+
+  /* ---------- 卡片 ---------- */
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    box-shadow: var(--shadow);
+    padding: 14px 16px;
+    margin-top: 16px;
+  }
+  .card > h2 {
+    font-size: 13px; font-weight: 600; margin: 0 0 10px; color: var(--fg);
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  }
+  .card > h2 .hint { font-weight: 400; color: var(--muted); font-size: 12px; }
+
+  /* ---------- 顶部数据条 ---------- */
+  .stats { display: flex; flex-wrap: wrap; gap: 10px 22px; align-items: flex-end; }
+  .stat { min-width: 86px; }
+  .stat .k { font-size: 11px; color: var(--muted); letter-spacing: .3px; }
+  .stat .v { font-size: 19px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.25; }
+  .stat .v small { font-size: 12px; font-weight: 400; color: var(--muted); margin-left: 3px; }
+
+  /* ---------- 画布 ---------- */
+  .stageCanvasBox { position: relative; margin-top: 12px; }
+  canvas#cabin { display: block; width: 100%; height: auto; }
+
+  /* ---------- 控件 ---------- */
+  .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  button {
+    font: inherit; color: var(--fg); background: var(--panel);
+    border: 1px solid var(--line); border-radius: 8px; padding: 6px 12px; cursor: pointer;
+    transition: border-color .12s, background .12s;
+  }
+  button:hover:not(:disabled) { border-color: var(--blue); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.primary { background: var(--blue); border-color: var(--blue); color: #fff; }
+  button.primary:hover:not(:disabled) { filter: brightness(1.06); }
+  select, input[type=range] { font: inherit; color: var(--fg); }
+  select {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+    padding: 6px 8px; width: 100%;
+  }
+  input[type=range] { width: 100%; accent-color: var(--blue); }
+
+  .grid2 { display: grid; grid-template-columns: minmax(0,1.95fr) minmax(0,1fr); gap: 16px; align-items: start; }
+  @media (max-width: 900px) { .grid2 { grid-template-columns: 1fr; } }
+
+  .field { margin-bottom: 12px; }
+  .field:last-child { margin-bottom: 0; }
+  .field .lab { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; font-size: 12px; color: var(--muted); }
+  .field .lab b { color: var(--fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 16px; margin-top: 10px; font-size: 12px; color: var(--muted); }
+  .legend i { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; vertical-align: 1px; }
+
+  .chartbox { margin-top: 6px; }
+  svg.chart { display: block; width: 100%; height: auto; overflow: visible; }
+  svg.chart text { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+  svg.chart text.lab-strong { fill: var(--fg); font-weight: 600; }
+
+  table.cmp { width: 100%; border-collapse: collapse; margin-top: 10px; font-variant-numeric: tabular-nums; }
+  table.cmp th, table.cmp td { text-align: right; padding: 7px 10px; border-bottom: 1px solid var(--line); font-size: 12.5px; white-space: nowrap; }
+  table.cmp th:first-child, table.cmp td:first-child { text-align: left; }
+  table.cmp th { color: var(--muted); font-weight: 500; }
+  table.cmp tr:last-child td { border-bottom: none; }
+  table.cmp td.rank1 { color: var(--green); font-weight: 600; }
+  table.cmp td.rankLast { color: var(--red); font-weight: 600; }
+  .tableScroll { overflow-x: auto; }
+
+  details.notes { margin-top: 16px; }
+  details.notes summary { cursor: pointer; font-size: 13px; color: var(--muted); }
+  details.notes ul { margin: 10px 0 0; padding-left: 18px; color: var(--muted); font-size: 12.5px; }
+  details.notes li { margin: 5px 0; }
+  details.notes b { color: var(--fg); font-weight: 600; }
+  .progressWrap { height: 4px; background: var(--line); border-radius: 3px; overflow: hidden; margin-top: 10px; display: none; }
+  .progressWrap.on { display: block; }
+  .progressWrap i { display: block; height: 100%; width: 0; background: var(--blue); transition: width .1s linear; }
+  .tag { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 20px; border: 1px solid var(--line); color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="top">
+    <h1>空客 A320 登机顺序模拟</h1>
+    <p>180 座（30 排 × 3-3）· 单通道 · 前舱门登机。每个人在过道放行李时都会把后面的人堵住，后面的人无法超越，只能排队等——这就是不同登机顺序耗时差异的来源。</p>
+  </header>
+
+  <div class="grid2" style="margin-top:16px">
+    <!-- ============ 左侧：动画舞台 ============ -->
+    <div>
+      <div class="card" style="margin-top:0">
+        <h2>
+          <span>机舱实时画面</span>
+          <span class="hint" id="phaseHint">点「开始」播放</span>
+        </h2>
+
+        <div class="stats">
+          <div class="stat"><div class="k">已用时间</div><div class="v" id="mTime">00:00</div></div>
+          <div class="stat"><div class="k">已就座</div><div class="v" id="mSeated">0<small>/180</small></div></div>
+          <div class="stat"><div class="k">通道堵塞中</div><div class="v" id="mBlocked">0<small>人</small></div></div>
+          <div class="stat"><div class="k">累计堵塞</div><div class="v" id="mWaste">0<small>人·分</small></div></div>
+        </div>
+
+        <div class="stageCanvasBox"><canvas id="cabin"></canvas></div>
+
+        <div class="legend">
+          <span><i style="background:var(--green)"></i>正常行走</span>
+          <span><i style="background:var(--orange)"></i>正在放行李（堵住通道）</span>
+          <span><i style="background:var(--blue)"></i>侧身入座</span>
+          <span><i style="background:var(--red)"></i>被堵住，原地等待</span>
+          <span><i style="background:var(--seat-line)"></i>空座位</span>
+          <span><i style="background:var(--purple)"></i>已就座</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>登机进度曲线 <span class="hint" id="curveHint">横轴＝时间，纵轴＝已就座人数</span></h2>
+        <div class="chartbox" id="curveBox"></div>
+      </div>
+    </div>
+
+    <!-- ============ 右侧：控制面板 ============ -->
+    <div>
+      <div class="card" style="margin-top:0">
+        <h2>运行控制</h2>
+        <div class="toolbar" style="margin-bottom:12px">
+          <button type="button" class="primary" id="btnPlay">开始</button>
+          <button type="button" id="btnReset">重置</button>
+          <button type="button" id="btnSkip">直接看结果</button>
+        </div>
+        <div class="field">
+          <div class="lab"><span>播放速度</span><b id="vSpeed">40×</b></div>
+          <input type="range" id="rSpeed" min="1" max="120" step="1" value="40" aria-label="播放速度">
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>登机顺序</h2>
+        <div class="field">
+          <select id="selStrategy" aria-label="登机顺序"></select>
+        </div>
+        <p style="margin:0;font-size:12px;color:var(--muted)" id="strategyDesc"></p>
+      </div>
+
+      <div class="card">
+        <h2>模型参数</h2>
+        <div class="field">
+          <div class="lab"><span>放行李平均耗时</span><b id="vStow">9.0 秒</b></div>
+          <input type="range" id="rStow" min="0" max="20" step="0.5" value="9" aria-label="放行李平均耗时">
+        </div>
+        <div class="field">
+          <div class="lab"><span>入座让人让路耗时</span><b id="vShuffle">8.0 秒</b></div>
+          <input type="range" id="rShuffle" min="0" max="16" step="0.5" value="8" aria-label="入座让路耗时">
+        </div>
+        <div class="field">
+          <div class="lab"><span>舱门放行间隔</span><b id="vDoor">1.5 秒/人</b></div>
+          <input type="range" id="rDoor" min="0.4" max="4" step="0.1" value="1.5" aria-label="舱门放行间隔">
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>顺序对比 <span class="hint">每种顺序跑多次取平均</span></h2>
+        <div class="field">
+          <div class="lab"><span>每种顺序运行次数</span><b id="vTrials">12 次</b></div>
+          <input type="range" id="rTrials" min="4" max="30" step="1" value="12" aria-label="运行次数">
+        </div>
+        <div class="toolbar">
+          <button type="button" class="primary" id="btnCompare">开始对比全部顺序</button>
+          <button type="button" id="btnReroll">换一批随机</button>
+        </div>
+        <div class="progressWrap" id="cmpProgress"><i id="cmpBar"></i></div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- 对比结果整行通栏：图表和表格需要更宽的空间 -->
+  <div class="card" id="cmpResultCard" style="display:none">
+    <h2>对比结果 <span class="hint" id="cmpHint"></span></h2>
+    <div class="chartbox" id="cmpChart"></div>
+    <div class="tableScroll"><table class="cmp" id="cmpTable"></table></div>
+  </div>
+
+  <details class="notes card" open>
+    <summary>模型说明与假设（点开/收起）</summary>
+    <ul>
+      <li><b>几何</b>：A320 典型单通道布局，30 排 × 3-3 共 180 座，全部从前舱门登机；通道只有一条，<b>任何时刻只能通过一个人</b>。</li>
+      <li><b>个人动作</b>：走到自己那一排 → 在过道里把行李塞进头顶行李架（平均 9 秒，对数正态分布，少数人很慢）→ 侧身进入座位。放行李与侧身入座期间<b>都占着通道</b>。</li>
+      <li><b>堵塞规则</b>：位次靠后的乘客无法超越前面的乘客。前方有人在放行李，后面要去更后排的乘客就只能在原地等——等待时间按人累计，就是"累计堵塞"。</li>
+      <li><b>同排座位干扰</b>：入座必须经过通道座 → 中间座 → 靠窗座。若入座路径上已经有人坐好，需要对方起身让路，每位额外 8 秒（可调）。所以靠窗的乘客先登机最省事。</li>
+      <li><b>舱门瓶颈</b>：舱门/廊桥口每人至少间隔 1.5 秒（可调），这是所有顺序共有的下限，用来表示现实中的门口排队。</li>
+      <li><b>数值说明</b>：时间是本模型的量，不是真实航班统计值。放行李耗时每次随机，所以同一顺序多跑几次结果会有波动；<b>重点看不同顺序之间的相对差异</b>。</li>
+      <li><b>现实参照</b>：真实航班中单通道飞机满客登机通常在 15~30 分钟。本模型假设每位乘客都按排队次序老实往前走，所以交错顺序的耗时偏理想化，实际收益会小一些。</li>
+    </ul>
+  </details>
+
+</div>
+
+<!-- ============================================================
+     仿真引擎：纯逻辑，不接触 DOM，可单独抽出来跑测试
+     ============================================================ -->
+<script id="sim-engine">
+const A320 = (function () {
+  'use strict';
+
+  // 座位编号 0..5 依次是 A B C | D E F
+  // A/F 靠窗、B/E 中间、C/D 紧邻通道；SEAT_DIST 表示"与通道之间还隔着几个座位"
+  const SEAT_LETTER = ['A', 'B', 'C', 'D', 'E', 'F'];
+  const SEAT_DIST = [2, 1, 0, 0, 1, 2];
+
+  // 默认参数（页面上可调的三项会覆盖 stowMean / shufflePer / doorInterval）
+  const DEF = {
+    rows: 30,          // 30 排 × 6 座 = 180 座
+    dt: 0.05,          // 仿真步长（秒）
+    minGap: 0.9,       // 通道内前后两人最小间距（单位：排，约 0.7 米）
+    walkSpeed: 1.0,    // 通道内行走速度（排/秒，约 0.76 米/秒）
+    stowMean: 9.0,     // 放行李平均耗时（秒）
+    stowSigma: 0.4,    // 放行李耗时的对数正态标准差（制造个体差异）
+    entryBase: 1.5,    // 侧身进入座位的基础耗时（秒）
+    shufflePer: 8.0,   // 每让一位已就座的同排乘客起身让路，额外耗时（秒）
+    doorInterval: 1.5, // 舱门每放行一人的最小间隔（秒）
+    blockAisle: true   // 放行李时是否完全堵住通道（false = 可以侧身挤过去）
+  };
+
+  // mulberry32：可复现的伪随机数发生器。同一种子必然得到同一结果，
+  // 这样"重置后再播放"看到的仍是同一场登机，方便对比。
+  function mulberry32(seed) {
+    let a = seed >>> 0;
+    return function () {
+      a = (a + 0x6D2B79F5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // 标准正态分布采样（Box-Muller 变换）
+  function gauss(rnd) {
+    let u = 0, v = 0;
+    while (u === 0) u = rnd();
+    while (v === 0) v = rnd();
+    return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+  }
+
+  // 放行李耗时：对数正态分布。大多数人 6~12 秒，少数人特别久（行李太大、找不到位置）
+  function sampleStow(rnd, o) {
+    if (o.stowMean <= 0) return 0;
+    const mu = Math.log(o.stowMean) - (o.stowSigma * o.stowSigma) / 2;
+    const v = Math.exp(mu + o.stowSigma * gauss(rnd));
+    return Math.max(0, Math.min(v, o.stowMean * 6));
+  }
+
+  // 侧身入座耗时：数一数"从通道到自己座位之间"已经坐了几个人，每人 8 秒
+  function enterTime(me, occupied, o) {
+    let n = 0;
+    if (me.seat < 3) { for (let s = me.seat + 1; s <= 2; s++) if (occupied[me.row][s]) n++; }
+    else { for (let s = 3; s < me.seat; s++) if (occupied[me.row][s]) n++; }
+    return o.entryBase + n * o.shufflePer;
+  }
+
+  /* 洗牌（Fisher-Yates），用传入的随机源保证可复现 */
+  function shuffle(arr, rnd) {
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(rnd() * (i + 1));
+      const t = arr[i]; arr[i] = arr[j]; arr[j] = t;
+    }
+    return arr;
+  }
+
+  /* ------------------------------------------------------------
+   * 生成登机顺序：返回 {row, seat} 数组，数组下标就是排队次序
+   * ---------------------------------------------------------- */
+  function buildOrder(strategy, rows, rnd) {
+    const all = [];
+    for (let r = 1; r <= rows; r++) for (let s = 0; s < 6; s++) all.push({ row: r, seat: s });
+    const out = [];
+    const byRow = (r) => all.filter(s => s.row === r);
+
+    switch (strategy) {
+      // ① 完全随机：没有组织，谁先到谁先上
+      case 'random':
+        return shuffle(all.slice(), rnd);
+
+      // ② 从前排到后排：前排先坐好，后面每个人都要越过前面所有人正在放的行李
+      case 'frontFirst':
+        for (let r = 1; r <= rows; r++) shuffle(byRow(r), rnd).forEach(s => out.push(s));
+        return out;
+
+      // ③ 从后向前分 3 区、区内随机：目前主流航空公司的做法
+      case 'backFirst3': {
+        const zone = Math.ceil(rows / 3);
+        for (let hi = rows; hi > 0; hi -= zone) {
+          const block = all.filter(s => s.row > hi - zone && s.row <= hi);
+          shuffle(block, rnd).forEach(s => out.push(s));
+        }
+        return out;
+      }
+
+      // ④ 严格按排：同一排 6 个人连着上（看似最有序，实际互相等）
+      case 'backFirstStrict':
+        for (let r = rows; r >= 1; r--) shuffle(byRow(r), rnd).forEach(s => out.push(s));
+        return out;
+
+      // ⑤ 窗户优先：先所有靠窗，再中间，最后通道；每组内部从后排往前排
+      case 'outsideIn':
+        for (const d of [2, 1, 0]) {
+          for (let r = rows; r >= 1; r--) {
+            out.push({ row: r, seat: 2 - d });   // 左侧那一列
+            out.push({ row: r, seat: 3 + d });   // 右侧那一列
+          }
+        }
+        return out;
+
+      // ⑥ Steffen 交错：窗/中/通道各成一组，组内隔 3 排、左右交替，
+      //    让相邻两位乘客既不同排（不抢同一处通道）又左右错开
+      case 'steffen':
+        for (const d of [2, 1, 0]) {
+          for (let round = 0; round < 2; round++) {
+            for (let phase = 0; phase < 3; phase++) {
+              for (let r = rows - phase; r >= 1; r -= 3) {
+                const left = ((r + phase + round) % 2) === 0;
+                out.push({ row: r, seat: left ? (2 - d) : (3 + d) });
+              }
+            }
+          }
+        }
+        return out;
+
+      default:
+        throw new Error('未知登机顺序: ' + strategy);
+    }
+  }
+
+  /* ------------------------------------------------------------
+   * 创建一次登机仿真
+   * 坐标：p = 沿通道的位置，单位是"排"。0 = 舱门；p<0 表示还在廊桥里排队；
+   *       排号 r 的乘客目标是 p = r。所以 p 越大越靠机尾。
+   * 关键不变量：任何人都不能超越前面的人（单通道），
+   *             因此"排队次序" = "通道里的前后次序"，可以按数组顺序线性扫描。
+   * ---------------------------------------------------------- */
+  function createRun(order, opts, rnd) {
+    const o = Object.assign({}, DEF, opts || {});
+    const n = order.length;
+
+    // 把乘客按排队次序摆进廊桥：第 i 位初始位置在 -minGap*(i+1)
+    const pax = order.map((s, i) => ({
+      id: i,
+      row: s.row,
+      seat: s.seat,
+      side: s.seat < 3 ? -1 : 1,
+      p: -o.minGap * (i + 1),
+      phase: 'walk',        // walk 行走 | stow 放行李 | enter 侧身入座 | seated 已就座
+      stowLeft: 0,
+      enterLeft: 0,
+      enterTotal: 0,
+      blockedAisle: 0,      // 被前面放行李的人堵住的时间（核心指标）
+      blockedDoor: 0,       // 在舱门口排队等待的时间
+      blockedNow: false,    // 刚刚这一步是不是被堵住了（给画面着色用）
+      crossed: false,
+      seatTime: 0
+    }));
+
+    const occupied = [];
+    for (let r = 0; r <= o.rows; r++) occupied.push([false, false, false, false, false, false]);
+    const seatTimes = new Array(n).fill(0);
+
+    const state = {
+      opts: o, pax, occupied, seatTimes, rows: o.rows,
+      t: 0, seated: 0, doorGate: 0, done: false
+    };
+
+    // 推进一个时间步 dt
+    state.step = function () {
+      if (state.done) return;
+      let aheadPos = Infinity;   // 通道里"前一名占道乘客"的位置
+      for (let i = 0; i < n; i++) pax[i].blockedNow = false;   // 每步重置"当前是否被堵"
+
+      for (let i = 0; i < n; i++) {
+        const me = pax[i];
+
+        if (me.phase === 'seated') continue;
+
+        if (me.phase === 'enter') {
+          me.enterLeft -= o.dt;
+          if (me.enterLeft > 0) {
+            aheadPos = me.p;   // 侧身入座/让人让路时仍站在通道口，堵住后面
+          } else {
+            me.phase = 'seated';
+            me.seatTime = state.t;
+            seatTimes[me.id] = state.t;
+            state.seated++;
+          }
+          continue;
+        }
+
+        // 两处限制：① 不能贴到前面那个人身上 ② 舱门每分钟放行人数有限
+        const limAisle = aheadPos - o.minGap;
+        const limDoor = (!me.crossed && state.t < state.doorGate) ? 0 : Infinity;
+        const limit = Math.min(limAisle, limDoor);
+
+        if (me.phase === 'walk') {
+          const want = Math.min(me.p + o.walkSpeed * o.dt, me.row); // 最多走到自己那一排
+          const got = Math.min(want, limit);
+          if (got < want - 1e-9) {                 // 想走却没走动 → 记一次堵塞
+            me.blockedNow = true;
+            if (limDoor < limAisle) me.blockedDoor += o.dt; else me.blockedAisle += o.dt;
+          }
+          if (got > me.p) me.p = got;
+          if (me.p > 0 && !me.crossed) {           // 刚刚跨过舱门
+            me.crossed = true;
+            state.doorGate = Math.max(state.doorGate, state.t + o.doorInterval);
+          }
+          if (me.p >= me.row - 1e-6) {             // 到达自己那一排 → 开始放行李
+            me.phase = 'stow';
+            me.stowLeft = sampleStow(rnd, o);
+          }
+          aheadPos = me.p;                         // 行走中的人始终占着通道
+        } else {                                   // stow：放行李
+          me.stowLeft -= o.dt;
+          if (me.stowLeft <= 0) {
+            me.phase = 'enter';
+            me.enterTotal = enterTime(me, occupied, o);
+            me.enterLeft = me.enterTotal;
+            occupied[me.row][me.seat] = true;       // 从这一刻起算"这排有人了"
+          }
+          if (o.blockAisle) aheadPos = me.p;        // 默认：放行李时完全堵死通道
+        }
+      }
+
+      state.t += o.dt;
+      if (state.seated >= n) state.done = true;
+      if (state.t > 100000) state.done = true;     // 兜底，防止死循环
+    };
+
+    // 汇总指标
+    state.summary = function () {
+      let aisle = 0, door = 0, maxAisle = 0;
+      for (const m of pax) {
+        aisle += m.blockedAisle;
+        door += m.blockedDoor;
+        if (m.blockedAisle > maxAisle) maxAisle = m.blockedAisle;
+      }
+      return {
+        total: state.t, aisleBlocked: aisle, doorBlocked: door,
+        maxAisleBlocked: maxAisle, pax, seatTimes
+      };
+    };
+
+    return state;
+  }
+
+  // 一次性跑完整场（用于统计对比，不做动画）
+  function runToEnd(order, opts, rnd) {
+    const s = createRun(order, opts, rnd);
+    while (!s.done) s.step();
+    return s.summary();
+  }
+
+  // 就座进度曲线：按固定时间间隔采样"这一刻已经坐下多少人"
+  function progressCurve(seatTimes, total, stepSec) {
+    const step = stepSec || 30;
+    const sorted = seatTimes.slice().sort((a, b) => a - b);
+    const pts = [];
+    for (let t = 0; t <= total + step; t += step) {
+      let k = 0;
+      while (k < sorted.length && sorted[k] <= t) k++;
+      pts.push([t, k]);
+    }
+    return pts;
+  }
+
+  /* 六种登机顺序的元数据（页面下拉框直接用） */
+  const STRATEGIES = [
+    { key: 'random', name: '随机顺序（无组织）', short: '随机（无组织）',
+      desc: '所有人随机排队。没有明显的集体规律，但后排乘客经常被前排正在放行李的人堵在通道里。' },
+    { key: 'frontFirst', name: '从前排到后排', short: '前 → 后',
+      desc: '前排先上。前排座位先坐满后，后面每一位乘客都要越过前面所有正在放行李的人，通道几乎全程处于堵塞状态。' },
+    { key: 'backFirst3', name: '从后排到前排 · 分 3 区（区内随机）', short: '后 → 前 · 3 区',
+      desc: '航空公司目前最常见的做法：先叫最后 10 排，再中间 10 排，最后前 10 排；同一区里的人随机先后。' },
+    { key: 'backFirstStrict', name: '从后排到前排 · 严格按排（同排一起上）', short: '后 → 前 · 严格',
+      desc: '看起来最有序：同一排的 6 个人连着登机。但同一排只有一处放行李的位置，6 个人只能排队轮流放，反而制造了新的堵塞点。' },
+    { key: 'outsideIn', name: '窗户优先（窗 → 中 → 通道）', short: '窗户优先',
+      desc: '先让所有靠窗乘客登机，再中间座位，最后通道座位。好处是没人需要别人起身让路，代价是同一排的左右两个靠窗乘客会抢同一处通道。' },
+    { key: 'steffen', name: 'Steffen 交错（隔 3 排 + 左右交替）', short: 'Steffen 交错',
+      desc: '相邻两位乘客的座位至少隔 3 排且分居左右两侧：既不会有人需要越过正在放行李的人，也不会两个人挤在同一排。' }
+  ];
+
+  return {
+    DEF, SEAT_LETTER, SEAT_DIST, STRATEGIES,
+    mulberry32, buildOrder, createRun, runToEnd, progressCurve
+  };
+})();
+</script>
+
+<!-- ============================================================
+     界面层：动画渲染 / 图表 / 蒙特卡洛对比
+     ============================================================ -->
+<script>
+(function () {
+  'use strict';
+
+  const $ = (id) => document.getElementById(id);
+  const rows = A320.DEF.rows;
+  const totalSeats = rows * 6;
+
+  /* ============ 各种小工具 ============ */
+
+  // 把秒格式化成 mm:ss（分钟可以超过 60，例如 46:19）
+  function fmtMMSS(sec) {
+    const s = Math.max(0, Math.floor(sec));
+    const m = Math.floor(s / 60);
+    return String(m).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
+  }
+
+  // 读取主题色（浅色/深色模式下画布颜色要跟着变）
+  function theme() {
+    const cs = getComputedStyle(document.documentElement);
+    const v = (n) => cs.getPropertyValue(n).trim();
+    return {
+      fg: v('--fg'), muted: v('--muted'), line: v('--line'),
+      seat: v('--seat'), seatLine: v('--seat-line'), panel: v('--panel'),
+      blue: v('--blue'), green: v('--green'), orange: v('--orange'),
+      red: v('--red'), purple: v('--purple')
+    };
+  }
+
+  const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
+
+  /* ============ 画布几何：机舱俯视图 ============ */
+  // 机头在左、机尾在右；横轴 = 排号（1 → 30），纵轴 = 左侧 A/B/C + 通道 + 右侧 D/E/F
+  function layout() {
+    const box = $('cabin').parentElement;
+    const W = Math.max(320, box.clientWidth || 720);
+    const padL = 76, padR = 16, padT = 24, padB = 22; // 左边留出廊桥/舱门的位置
+    const colW = (W - padL - padR) / rows;            // 每一排占多宽
+    const seatH = clamp(colW * 0.72, 9, 20);          // 单个座位的厚度
+    const aisleH = clamp(colW * 1.05, 15, 30);        // 通道宽度
+    const cabH = seatH * 6 + aisleH;
+    return {
+      W, H: padT + cabH + padB, padL, padR, padT, padB,
+      colW, seatH, aisleH, cabH,
+      x0: padL, y0: padT,
+      aisleY: padT + seatH * 3 + aisleH / 2
+    };
+  }
+
+  // 第 band 条座位带的顶部 y（band 0/1/2 = 左侧三列，3/4/5 = 右侧三列，中间隔着通道）
+  function seatTopY(L, band) {
+    return L.y0 + (band < 3 ? band * L.seatH : 3 * L.seatH + L.aisleH + (band - 3) * L.seatH);
+  }
+
+  // 通道坐标 p（单位：排）→ 画布 x
+  function posToX(L, p) {
+    // p=r 表示"第 r 排"，第 r 排的格心在 (r-0.5) 个列宽处，所以这里减 0.5 对齐座位
+    if (p >= 0) return L.x0 + (clamp(p, 0, rows) - 0.5) * L.colW;
+    // p<0 表示还在廊桥里：压缩到左侧 70px 内，越靠后越挤，直观表现"门口排队"
+    const k = clamp(-p / 160, 0, 1);
+    return L.x0 - 4 - k * (L.padL - 14);
+  }
+
+  /* ============ 状态 ============ */
+  const state = {
+    strategy: 'random',
+    seedBuild: 20261003,   // 负责生成登机顺序
+    seedSim: 777,          // 负责生成每个人的放行李耗时
+    run: null,             // 当前仿真实例
+    order: null,
+    preTotal: 600,         // 预跑得到的最终耗时（只用于确定坐标轴范围）
+    playing: false,
+    speed: 40,             // 播放倍速：1 秒真实时间 = speed 秒仿真时间
+    simTime: 0,            // 动画已经播放到的仿真时间
+    lastFrame: 0,
+    lastCurveDraw: 0,
+    comparison: null       // 蒙特卡洛对比结果
+  };
+
+  /* ============ 建立 / 重置一次运行 ============ */
+  function currentParams() {
+    return {
+      stowMean: parseFloat($('rStow').value),
+      shufflePer: parseFloat($('rShuffle').value),
+      doorInterval: parseFloat($('rDoor').value)
+    };
+  }
+
+  function rebuild(keepTime) {
+    const p = currentParams();
+
+    // 1) 生成登机顺序（用固定的种子，保证"重置"后看到的是同一场登机）
+    const rndBuild = A320.mulberry32(hashKey(state.strategy) ^ state.seedBuild);
+    const order = A320.buildOrder(state.strategy, rows, rndBuild);
+
+    // 2) 先在后台用同一串随机数把这场登机跑一遍，只为了拿到最终耗时定坐标轴范围
+    const pre = A320.runToEnd(order, p, A320.mulberry32(state.seedSim));
+    state.preTotal = pre.total;
+
+    // 3) 真正用于动画的实例：随机种子与上面一致，所以播放过程和预跑完全一样
+    state.order = order;
+    state.run = A320.createRun(order, p, A320.mulberry32(state.seedSim));
+    state.simTime = 0;
+    state.playing = false;
+    $('btnPlay').textContent = '开始';
+    $('phaseHint').textContent = '点「开始」播放';
+    updateStats();
+    drawCabin(true);
+    drawCurve(true);
+  }
+
+  // 把策略名映射成一个整数，用作随机种子的一部分
+  function hashKey(k) {
+    let h = 2166136261;
+    for (let i = 0; i < k.length; i++) { h ^= k.charCodeAt(i); h = Math.imul(h, 16777619); }
+    return h >>> 0;
+  }
+
+  /* ============ 指标条 ============ */
+  function updateStats() {
+    const r = state.run;
+    if (!r) return;
+    let aisleWaste = 0, blockedCount = 0;
+    for (const m of r.pax) {
+      aisleWaste += m.blockedAisle;
+      if (m.blockedNow) blockedCount++;
+    }
+    $('mTime').textContent = fmtMMSS(r.t);
+    $('mSeated').innerHTML = r.seated + '<small>/' + totalSeats + '</small>';
+    $('mBlocked').innerHTML = blockedCount + '<small>人</small>';
+    $('mWaste').innerHTML = (aisleWaste / 60).toFixed(1) + '<small>人·分</small>';
+  }
+
+  /* ============ 画机舱 ============ */
+  function drawCabin(force) {
+    const cv = $('cabin');
+    const L = layout();
+    const dpr = window.devicePixelRatio || 1;
+    if (cv.width !== Math.round(L.W * dpr) || cv.height !== Math.round(L.H * dpr)) {
+      cv.width = Math.round(L.W * dpr);
+      cv.height = Math.round(L.H * dpr);
+      cv.style.aspectRatio = L.W + ' / ' + L.H;
+    }
+    const g = cv.getContext('2d');
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.clearRect(0, 0, L.W, L.H);
+    const C = theme();
+    const r = state.run;
+    if (!r) return;
+
+    // ---- 机身轮廓 ----
+    const cabW = rows * L.colW;
+    g.save();
+    g.strokeStyle = C.line;
+    g.lineWidth = 1;
+    roundRect(g, L.x0 - 0.5, L.y0 - 3.5, cabW + 1, L.cabH + 7, 9);
+    g.stroke();
+    g.restore();
+
+    // ---- 通道底色 ----
+    g.fillStyle = C.seat;
+    g.globalAlpha = 0.55;
+    g.fillRect(L.x0, L.aisleY - L.aisleH / 2, cabW, L.aisleH);
+    g.globalAlpha = 1;
+
+    // ---- 排号刻度（每 5 排标一次）----
+    g.fillStyle = C.muted;
+    g.font = '10px -apple-system, sans-serif';
+    g.textAlign = 'center';
+    for (let rr = 5; rr <= rows; rr += 5) {
+      const x = L.x0 + (rr - 0.5) * L.colW;
+      g.fillText(String(rr), x, L.y0 - 12);
+      g.globalAlpha = 0.5;
+      g.strokeStyle = C.line;
+      g.beginPath(); g.moveTo(x, L.y0 - 6); g.lineTo(x, L.y0 - 2); g.stroke();
+      g.globalAlpha = 1;
+    }
+    g.textAlign = 'left';
+    g.fillText('排', L.x0 + cabW + 4, L.y0 - 12);
+
+    // ---- 座位 ----
+    for (let rr = 1; rr <= rows; rr++) {
+      for (let s = 0; s < 6; s++) {
+        const x = L.x0 + (rr - 1) * L.colW + L.colW * 0.12;
+        const y = seatTopY(L, s) + L.seatH * 0.15;
+        const w = L.colW * 0.76, h = L.seatH * 0.7;
+        const taken = r.occupied[rr][s];
+        g.fillStyle = taken ? C.purple : C.seat;
+        if (taken) g.globalAlpha = 0.85;
+        roundRect(g, x, y, w, h, Math.min(3, h / 2));
+        g.fill();
+        g.globalAlpha = 1;
+        if (!taken && L.colW > 13) {
+          g.strokeStyle = C.seatLine;
+          g.lineWidth = 1;
+          roundRect(g, x, y, w, h, Math.min(3, h / 2));
+          g.stroke();
+        }
+      }
+    }
+
+    // ---- 舱门 / 廊桥 ----
+    g.strokeStyle = C.seatLine;
+    g.setLineDash([3, 3]);
+    g.beginPath(); g.moveTo(L.x0, L.y0 - 4); g.lineTo(L.x0, L.y0 + L.cabH + 4); g.stroke();
+    g.setLineDash([]);
+    g.fillStyle = C.muted;
+    g.font = '10px -apple-system, sans-serif';
+    g.textAlign = 'right';
+    g.fillText('舱门', L.x0 - 4, L.y0 + L.cabH + 14);
+    g.textAlign = 'left';
+    g.fillText('廊桥排队', 2, L.y0 + L.cabH + 14);
+
+    // ---- 通道堵塞段：最前面的"占道者"到最后一个被堵乘客之间的红色带 ----
+    let frontBlocker = null;
+    for (const m of r.pax) {
+      if ((m.phase === 'stow' || m.phase === 'enter') && (!frontBlocker || m.p > frontBlocker.p)) frontBlocker = m;
+    }
+    let lastBlocked = null;
+    for (const m of r.pax) {
+      if (m.blockedNow) lastBlocked = m; // 数组本身按排队次序，越靠后位置越浅
+    }
+    if (frontBlocker && lastBlocked && lastBlocked.p < frontBlocker.p) {
+      const x1 = posToX(L, lastBlocked.p), x2 = posToX(L, frontBlocker.p);
+      g.fillStyle = C.red;
+      g.globalAlpha = 0.16;
+      g.fillRect(x1, L.aisleY - L.aisleH / 2, Math.max(1, x2 - x1), L.aisleH);
+      g.globalAlpha = 1;
+    }
+
+    // ---- 乘客 ----
+    const rad = clamp(L.colW * 0.24, 2.2, 5);
+    for (const m of r.pax) {
+      if (m.phase === 'seated' && !force) continue; // 已入座的人不再画（座位上已经有紫色标记）
+      let x, y;
+      if (m.phase === 'enter') {
+        // 侧身入座：从通道中心插值移动到座位中心
+        const k = 1 - clamp(m.enterLeft / Math.max(m.enterTotal, 0.001), 0, 1);
+        const targetY = seatTopY(L, m.seat) + L.seatH / 2;
+        x = L.x0 + (m.row - 0.5) * L.colW;
+        y = L.aisleY + (targetY - L.aisleY) * k;
+      } else if (m.phase === 'stow') {
+        x = posToX(L, m.row); y = L.aisleY;
+      } else {
+        x = posToX(L, m.p); y = L.aisleY;
+      }
+
+      const blocked = m.blockedNow;
+      let color = blocked ? C.red : C.green;
+      if (m.phase === 'stow') color = C.orange;
+      else if (m.phase === 'enter') color = C.blue;
+      else if (m.phase === 'seated') color = C.purple;
+
+      g.beginPath();
+      g.arc(x, y, blocked ? rad * 1.15 : rad, 0, Math.PI * 2);
+      g.fillStyle = color;
+      g.fill();
+      if (m === frontBlocker && m.phase === 'stow') {  // 当前堵住别人的那位，画个圈强调
+        g.strokeStyle = C.red;
+        g.lineWidth = 1.5;
+        g.beginPath(); g.arc(x, y, rad + 3, 0, Math.PI * 2); g.stroke();
+      }
+    }
+  }
+
+  function roundRect(g, x, y, w, h, r) {
+    const rr = Math.min(r, w / 2, h / 2);
+    g.beginPath();
+    g.moveTo(x + rr, y);
+    g.arcTo(x + w, y, x + w, y + h, rr);
+    g.arcTo(x + w, y + h, x, y + h, rr);
+    g.arcTo(x, y + h, x, y, rr);
+    g.arcTo(x, y, x + w, y, rr);
+    g.closePath();
+  }
+
+  /* ============ 逐帧推进 ============ */
+  function frame(now) {
+    if (!state.run) return;
+    const dtReal = Math.min(0.1, (now - state.lastFrame) / 1000 || 0);
+    state.lastFrame = now;
+
+    if (state.playing && !state.run.done) {
+      state.simTime += dtReal * state.speed;
+      // 按 dt 步进到目标时间（一帧可能要走很多步，所以加个上限防止卡死）
+      let guard = 0;
+      while (state.run.t < state.simTime && !state.run.done && guard++ < 4000) state.run.step();
+      if (state.run.done) {
+        state.playing = false;
+        $('btnPlay').textContent = '重新播放';
+        $('phaseHint').textContent = '全员就座，总耗时 ' + fmtMMSS(state.run.t);
+      }
+    }
+
+    drawCabin(false);
+    updateStats();
+    if (now - state.lastCurveDraw > 220) { state.lastCurveDraw = now; drawCurve(false); }
+    requestAnimationFrame(frame);
+  }
+
+  /* ============ 进度曲线 ============ */
+  function drawCurve(force) {
+    const host = $('curveBox');
+    const r = state.run;
+    if (!r) return;
+    const W = Math.max(300, host.clientWidth || 640);
+    const H = 210, ml = 46, mr = 14, mt = 12, mb = 30;
+    const iw = W - ml - mr, ih = H - mt - mb;
+
+    // 横轴范围：用预跑得到的最终耗时向上取整到整分钟，保证播放过程中坐标轴不跳动
+    const xMax = Math.max(60, Math.ceil(state.preTotal / 60) * 60);
+    const yMax = totalSeats;
+    const X = (t) => ml + (t / xMax) * iw;
+    const Y = (v) => mt + ih - (v / yMax) * ih;
+
+    // 已就座乘客的时间点
+    const seatedTimes = r.pax.filter(m => m.phase === 'seated').map(m => m.seatTime).sort((a, b) => a - b);
+    const stepSec = xMax / 60;
+    let path = 'M ' + X(0).toFixed(1) + ' ' + Y(0).toFixed(1);
+    let k = 0;
+    for (let t = 0; t <= xMax; t += stepSec) {
+      while (k < seatedTimes.length && seatedTimes[k] <= t) k++;
+      path += ' L ' + X(t).toFixed(1) + ' ' + Y(k).toFixed(1);
+    }
+
+    let svg = '<svg class="chart" viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H +
+      '" role="img" aria-label="登机进度曲线">';
+    // 网格
+    for (let i = 0; i <= 4; i++) {
+      const v = yMax * i / 4, y = Y(v);
+      svg += '<line x1="' + ml + '" y1="' + y.toFixed(1) + '" x2="' + (ml + iw) + '" y2="' + y.toFixed(1) +
+        '" stroke="var(--line)" stroke-width="1"/>';
+      svg += '<text x="' + (ml - 6) + '" y="' + (y + 3.5).toFixed(1) + '" text-anchor="end">' + v + '</text>';
+    }
+    for (let i = 0; i <= 4; i++) {
+      const t = xMax * i / 4, x = X(t);
+      svg += '<text x="' + x.toFixed(1) + '" y="' + (mt + ih + 16) + '" text-anchor="middle">' + Math.round(t / 60) + '</text>';
+    }
+    svg += '<text x="' + (ml + iw / 2) + '" y="' + (H - 2) + '" text-anchor="middle">时间（分钟）</text>';
+    svg += '<text x="' + (ml - 38) + '" y="' + (mt + ih / 2) + '" text-anchor="middle" transform="rotate(-90 ' +
+      (ml - 38) + ' ' + (mt + ih / 2) + ')">已就座人数</text>';
+    svg += '<line x1="' + ml + '" y1="' + (mt + ih) + '" x2="' + (ml + iw) + '" y2="' + (mt + ih) + '" stroke="var(--line)"/>';
+
+    // 参考：如果已经跑过全部顺序对比，把每条平均曲线淡淡地画在背景里
+    if (state.comparison && state.comparison.sameParams) {
+      for (const g of state.comparison.results) {
+        if (g.key === state.strategy || !g.curve) continue;
+        let p2 = '';
+        g.curve.forEach((pt, idx) => {
+          const x = ml + clamp(pt[0] / xMax, 0, 1) * iw, y = Y(pt[1]);
+          p2 += (idx ? ' L ' : 'M ') + x.toFixed(1) + ' ' + y.toFixed(1);
+        });
+        svg += '<path d="' + p2 + '" fill="none" stroke="var(--muted)" stroke-width="1" opacity="0.35"/>';
+      }
+    }
+
+    svg += '<path d="' + path + '" fill="none" stroke="var(--blue)" stroke-width="2.4" stroke-linejoin="round"/>';
+    svg += '<text class="lab-strong" x="' + (ml + iw - 2) + '" y="' + (mt + 12) + '" text-anchor="end">' +
+      (state.run.seated) + ' / ' + totalSeats + '</text>';
+    svg += '</svg>';
+    host.innerHTML = svg;
+  }
+
+  /* ============ 蒙特卡洛对比 ============ */
+  const sleep0 = () => new Promise(res => setTimeout(res, 0));
+
+  async function runComparison() {
+    const trials = parseInt($('rTrials').value, 10);
+    const p = currentParams();
+    const btn = $('btnCompare');
+    btn.disabled = true;
+    $('cmpProgress').classList.add('on');
+    $('cmpResultCard').style.display = 'block';
+    $('cmpHint').textContent = '计算中…';
+
+    const results = A320.STRATEGIES.map(s => ({
+      key: s.key, name: s.name, short: s.short, totals: [], aisle: [], curve: null
+    }));
+    const totalRuns = results.length * trials;
+    let done = 0;
+    let maxTotal = 0;
+
+    for (const g of results) {
+      const curves = [];
+      for (let k = 0; k < trials; k++) {
+        // 每条顺序用同一批随机种子，减少"运气"带来的差异
+        const seed = (state.seedSim + k * 104729) >>> 0;
+        const rndBuild = A320.mulberry32(hashKey(g.key) ^ state.seedBuild);
+        const order = A320.buildOrder(g.key, rows, rndBuild);
+        const s = A320.runToEnd(order, p, A320.mulberry32(seed));
+        g.totals.push(s.total);
+        g.aisle.push(s.aisleBlocked);
+        curves.push(s.seatTimes);
+        maxTotal = Math.max(maxTotal, s.total);
+        done++;
+        $('cmpBar').style.width = (done / totalRuns * 100).toFixed(1) + '%';
+        await sleep0();   // 让出主线程，界面不卡
+      }
+      // 平均进度曲线：固定时间网格上取平均
+      const gridStep = Math.max(20, Math.ceil(maxTotal / 50));
+      const npts = Math.ceil(maxTotal / gridStep) + 1;
+      const acc = new Array(npts).fill(0);
+      for (const st of curves) {
+        const sorted = st.slice().sort((a, b) => a - b);
+        let idx = 0;
+        for (let i = 0; i < npts; i++) {
+          const t = i * gridStep;
+          while (idx < sorted.length && sorted[idx] <= t) idx++;
+          acc[i] += idx / trials;
+        }
+      }
+      g.curve = acc.map((v, i) => [i * gridStep, v]);
+    }
+
+    const mean = (a) => a.reduce((x, y) => x + y, 0) / a.length;
+    const randomMean = mean(results.find(r => r.key === 'random').totals);
+    for (const g of results) {
+      g.mean = mean(g.totals);
+      g.min = Math.min.apply(null, g.totals);
+      g.max = Math.max.apply(null, g.totals);
+      g.aisleMean = mean(g.aisle);
+    }
+    const sorted = results.slice().sort((a, b) => a.mean - b.mean);
+    sorted.forEach((g, i) => { g.rank = i + 1; });
+
+    state.comparison = { results, sameParams: true, trials, baseline: randomMean };
+    drawCompareChart(sorted);
+    fillCompareTable(sorted);
+    $('cmpHint').textContent = '每种顺序 ' + trials + ' 次运行的平均值（参数：放行李 ' +
+      p.stowMean + ' 秒 / 让路 ' + p.shufflePer + ' 秒 / 舱门 ' + p.doorInterval + ' 秒）';
+    $('cmpProgress').classList.remove('on');
+    btn.disabled = false;
+    drawCurve(true);
+  }
+
+  function drawCompareChart(sorted) {
+    const host = $('cmpChart');
+    const W = Math.max(300, host.clientWidth || 520);
+    const narrow = W < 560;
+    const best = sorted[0].mean, worst = sorted[sorted.length - 1].mean;
+    const rowH = narrow ? 44 : 34;
+    const labelW = narrow ? 0 : 168;
+    const H = 16 + sorted.length * rowH + 8;
+    const barMax = W - labelW - 74;
+    const X = (t) => labelW + (t / (worst * 1.04)) * barMax;
+
+    let svg = '<svg class="chart" viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H +
+      '" role="img" aria-label="各登机顺序平均耗时对比">';
+    sorted.forEach((g, i) => {
+      const top = 10 + i * rowH;
+      const barY = narrow ? top + 16 : top + 4;
+      const barH = narrow ? 12 : 16;
+      const x0 = X(0), x1 = X(g.mean);
+      const isBest = i === 0, isWorst = i === sorted.length - 1;
+      const color = isBest ? 'var(--green)' : (isWorst ? 'var(--red)' : 'var(--blue)');
+
+      // 名称
+      if (narrow) {
+        svg += '<text class="lab-strong" x="0" y="' + (top + 10) + '">' + g.short + '</text>';
+        svg += '<text x="' + W + '" y="' + (top + 10) + '" text-anchor="end">' + fmtMMSS(g.mean) + '</text>';
+      } else {
+        svg += '<text class="lab-strong" x="0" y="' + (barY + barH - 2) + '">' + g.short + '</text>';
+      }
+      // 条
+      svg += '<rect x="' + x0 + '" y="' + barY + '" width="' + Math.max(1, x1 - x0) + '" height="' + barH +
+        '" rx="' + (barH / 2) + '" fill="' + color + '" opacity="' + (isBest || isWorst ? 0.9 : 0.62) + '"/>';
+      // 最短/最长范围（细线 + 端点）
+      if (narrow) {
+        const xa = X(g.min), xb = X(g.max);
+        svg += '<line x1="' + xa + '" y1="' + (barY + barH + 6) + '" x2="' + xb + '" y2="' + (barY + barH + 6) +
+          '" stroke="var(--muted)" stroke-width="1" opacity="0.7"/>';
+      } else {
+        const xv = X(g.mean), yv = barY + barH + 8;
+        svg += '<line x1="' + X(g.min) + '" y1="' + yv + '" x2="' + X(g.max) + '" y2="' + yv +
+          '" stroke="var(--muted)" stroke-width="1" opacity="0.7"/>';
+        svg += '<line x1="' + xv + '" y1="' + (barY + barH - 3) + '" x2="' + xv + '" y2="' + (yv - 3) +
+          '" stroke="var(--panel)" stroke-width="2"/>';
+        svg += '<text x="' + (x1 + 8) + '" y="' + (barY + barH - 3) + '">' + fmtMMSS(g.mean) + '</text>';
+      }
+    });
+    svg += '</svg>';
+    host.innerHTML = svg;
+  }
+
+  function fillCompareTable(sorted) {
+    const base = state.comparison.baseline;
+    let html = '<thead><tr><th>登机顺序</th><th>平均总耗时</th><th>最短~最长</th>' +
+      '<th>相对随机</th><th>通道堵塞(人·分)</th></tr></thead><tbody>';
+    for (const g of sorted) {
+      const rel = g.mean / base;
+      const cls = g.rank === 1 ? 'rank1' : (g.rank === sorted.length ? 'rankLast' : '');
+      html += '<tr><td>' + g.short + '</td>' +
+        '<td class="' + cls + '">' + fmtMMSS(g.mean) + '</td>' +
+        '<td>' + fmtMMSS(g.min) + ' ~ ' + fmtMMSS(g.max) + '</td>' +
+        '<td>' + (rel * 100).toFixed(0) + '%</td>' +
+        '<td>' + (g.aisleMean / 60).toFixed(0) + '</td></tr>';
+    }
+    html += '</tbody>';
+    $('cmpTable').innerHTML = html;
+  }
+
+  /* ============ 交互绑定 ============ */
+  function initSelect() {
+    const sel = $('selStrategy');
+    sel.innerHTML = A320.STRATEGIES.map(s => '<option value="' + s.key + '">' + s.name + '</option>').join('');
+    sel.value = state.strategy;
+    updateStrategyDesc();
+  }
+  function updateStrategyDesc() {
+    const s = A320.STRATEGIES.find(x => x.key === state.strategy);
+    $('strategyDesc').textContent = s ? s.desc : '';
+  }
+
+  function syncLabels() {
+    $('vSpeed').textContent = state.speed + '×';
+    $('vStow').textContent = parseFloat($('rStow').value).toFixed(1) + ' 秒';
+    $('vShuffle').textContent = parseFloat($('rShuffle').value).toFixed(1) + ' 秒';
+    $('vDoor').textContent = parseFloat($('rDoor').value).toFixed(1) + ' 秒/人';
+    $('vTrials').textContent = $('rTrials').value + ' 次';
+  }
+
+  // 参数一变就作废旧对比结果（结果只对当时的参数有效）
+  function invalidateComparison() {
+    state.comparison = null;
+    $('cmpResultCard').style.display = 'none';
+    $('cmpHint').textContent = '';
+  }
+
+  function bind() {
+    $('btnPlay').addEventListener('click', () => {
+      if (state.run.done) { rebuild(); state.playing = true; $('btnPlay').textContent = '暂停'; return; }
+      state.playing = !state.playing;
+      $('btnPlay').textContent = state.playing ? '暂停' : '继续';
+      if (state.playing) state.simTime = state.run.t;
+      $('phaseHint').textContent = state.playing ? '播放中…' : '已暂停';
+    });
+    $('btnReset').addEventListener('click', () => { rebuild(); });
+    $('btnSkip').addEventListener('click', () => {
+      if (state.run.done) rebuild();
+      while (!state.run.done) state.run.step();
+      state.simTime = state.run.t;
+      state.playing = false;
+      $('btnPlay').textContent = '重新播放';
+      $('phaseHint').textContent = '全员就座，总耗时 ' + fmtMMSS(state.run.t);
+      drawCabin(false); updateStats(); drawCurve(true);
+    });
+
+    $('rSpeed').addEventListener('input', () => { state.speed = parseInt($('rSpeed').value, 10); syncLabels(); });
+    $('rTrials').addEventListener('input', syncLabels);
+
+    // 三个物理参数：改了就重建（重置动画，但对比结果保留到下次对比）
+    for (const id of ['rStow', 'rShuffle', 'rDoor']) {
+      $(id).addEventListener('input', () => { syncLabels(); invalidateComparison(); rebuild(); });
+    }
+
+    $('selStrategy').addEventListener('change', () => {
+      state.strategy = $('selStrategy').value;
+      updateStrategyDesc();
+      rebuild();
+    });
+
+    $('btnReroll').addEventListener('click', () => {
+      state.seedBuild = (state.seedBuild + 7919) >>> 0;
+      state.seedSim = (state.seedSim + 104729) >>> 0;
+      invalidateComparison();
+      rebuild();
+    });
+
+    $('btnCompare').addEventListener('click', () => {
+      if (state.comparison) { drawCurve(true); return; }
+      runComparison();
+    });
+
+    // 空格键 = 播放/暂停
+    window.addEventListener('keydown', (e) => {
+      if (e.code === 'Space' && !/INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName)) {
+        e.preventDefault(); $('btnPlay').click();
+      }
+    });
+
+    // 尺寸/主题变化重绘
+    if (window.ResizeObserver) {
+      const ro = new ResizeObserver(() => { drawCabin(true); drawCurve(true); });
+      ro.observe($('cabin').parentElement);
+      ro.observe($('curveBox'));
+    }
+    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { drawCabin(true); drawCurve(true); });
+  }
+
+  /* ============ 启动 ============ */
+  initSelect();
+  syncLabels();
+  bind();
+  rebuild();
+  requestAnimationFrame((t) => { state.lastFrame = t; requestAnimationFrame(frame); });
+})();
+</script>
+
+</body>
+</html>
